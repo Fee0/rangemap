@@ -87,7 +87,7 @@ where
 impl<K, V> quickcheck::Arbitrary for RangeMap<K, V>
 where
     K: quickcheck::Arbitrary + Ord,
-    V: quickcheck::Arbitrary + PartialEq,
+    V: quickcheck::Arbitrary,
 {
     fn arbitrary(g: &mut quickcheck::Gen) -> Self {
         // REVISIT: allocation could be avoided if Gen::gen_size were public (https://github.com/BurntSushi/quickcheck/issues/326#issue-2653601170)
@@ -243,17 +243,13 @@ where
 impl<K, V> RangeMap<K, V>
 where
     K: Ord + Clone,
-    V: PartialEq + Clone,
+    V: Clone,
 {
     /// Insert a pair of key range and value into the map.
     ///
     /// If the inserted range partially or completely overlaps any
     /// existing range in the map, then the existing range (or ranges) will be
     /// partially or completely replaced by the inserted range.
-    ///
-    /// If the inserted range either overlaps or is immediately adjacent
-    /// any existing range _mapping to the same value_, then the ranges
-    /// will be coalesced into a single contiguous range.
     ///
     /// # Panics
     ///
@@ -266,7 +262,7 @@ where
         // Wrap up the given range so that we can "borrow"
         // it as a wrapper reference to either its start or end.
         // See `range_wrapper.rs` for explanation of these hacks.
-        let mut new_start_wrapper: RangeStartWrapper<K> = RangeStartWrapper::new(range);
+        let new_start_wrapper: RangeStartWrapper<K> = RangeStartWrapper::new(range);
         let new_value = value;
 
         // Is there a stored range either overlapping the start of
@@ -282,28 +278,23 @@ where
                 Bound::Included(&new_start_wrapper),
             ))
             .rev()
-            .take(2)
+            .take(1)
             .filter(|(stored_start_wrapper, _stored_value)| {
-                // Does the candidate range either overlap
-                // or immediately precede the range to insert?
+                // Does the candidate range overlap the range to insert?
                 // (Remember that it might actually cover the _whole_
                 // range to insert and then some.)
                 stored_start_wrapper
                     .end_wrapper
                     .range
-                    .touches(&new_start_wrapper.end_wrapper.range)
+                    .overlaps(&new_start_wrapper.end_wrapper.range)
             });
-        if let Some(mut candidate) = candidates.next() {
-            // Or the one before it if both cases described above exist.
-            if let Some(another_candidate) = candidates.next() {
-                candidate = another_candidate;
-            }
-            let (stored_start_wrapper, stored_value) = (candidate.0.clone(), candidate.1.clone());
+        if let Some((stored_start_wrapper, stored_value)) = candidates.next() {
+            let (stored_start_wrapper, stored_value) =
+                (stored_start_wrapper.clone(), stored_value.clone());
             self.adjust_touching_ranges_for_insert(
                 stored_start_wrapper,
                 stored_value,
-                &mut new_start_wrapper.end_wrapper.range,
-                &new_value,
+                &new_start_wrapper.end_wrapper.range,
             );
         }
 
@@ -327,34 +318,17 @@ where
             .btm
             .range::<RangeStartWrapper<K>, (Bound<&RangeStartWrapper<K>>, Bound<&RangeStartWrapper<K>>)>((
                 Bound::Included(&new_start_wrapper),
-                Bound::Included(&new_range_end_as_start),
+                Bound::Excluded(&new_range_end_as_start),
             ))
             .next()
         {
-            // One extra exception: if we have different values,
-            // and the stored range starts at the end of the range to insert,
-            // then we don't want to keep looping forever trying to find more!
-            #[allow(clippy::suspicious_operation_groupings)]
-            if stored_start_wrapper.end_wrapper.range.start
-                == new_start_wrapper.end_wrapper.range.end
-                && *stored_value != new_value
-            {
-                // We're beyond the last stored range that could be relevant.
-                // Avoid wasting time on irrelevant ranges, or even worse, looping forever.
-                // (`adjust_touching_ranges_for_insert` below assumes that the given range
-                // is relevant, and behaves very poorly if it is handed a range that it
-                // shouldn't be touching.)
-                break;
-            }
-
             let stored_start_wrapper = stored_start_wrapper.clone();
             let stored_value = stored_value.clone();
 
             self.adjust_touching_ranges_for_insert(
                 stored_start_wrapper,
                 stored_value,
-                &mut new_start_wrapper.end_wrapper.range,
-                &new_value,
+                &new_start_wrapper.end_wrapper.range,
             );
         }
 
@@ -440,50 +414,28 @@ where
         &mut self,
         stored_start_wrapper: RangeStartWrapper<K>,
         stored_value: V,
-        new_range: &mut Range<K>,
-        new_value: &V,
+        new_range: &Range<K>,
     ) {
-        use core::cmp::{max, min};
-
-        if stored_value == *new_value {
-            // The ranges have the same value, so we can "adopt"
-            // the stored range.
-            //
-            // This means that no matter how big or where the stored range is,
-            // we will expand the new range's bounds to subsume it,
-            // and then delete the stored range.
-            new_range.start = min(&new_range.start, &stored_start_wrapper.start).clone();
-            new_range.end = max(&new_range.end, &stored_start_wrapper.end).clone();
-            self.btm.remove(&stored_start_wrapper);
-        } else {
-            // The ranges have different values.
-            if new_range.overlaps(&stored_start_wrapper.range) {
-                // The ranges overlap. This is a little bit more complicated.
-                // Delete the stored range, and then add back between
-                // 0 and 2 subranges at the ends of the range to insert.
-                self.btm.remove(&stored_start_wrapper);
-                if stored_start_wrapper.start < new_range.start {
-                    // Insert the piece left of the range to insert.
-                    self.btm.insert(
-                        RangeStartWrapper::new(
-                            stored_start_wrapper.end_wrapper.range.start..new_range.start.clone(),
-                        ),
-                        stored_value.clone(),
-                    );
-                }
-                if stored_start_wrapper.end_wrapper.range.end > new_range.end {
-                    // Insert the piece right of the range to insert.
-                    self.btm.insert(
-                        RangeStartWrapper::new(
-                            new_range.end.clone()..stored_start_wrapper.end_wrapper.range.end,
-                        ),
-                        stored_value,
-                    );
-                }
-            } else {
-                // No-op; they're not overlapping,
-                // so we can just keep both ranges as they are.
-            }
+        // The ranges overlap. Delete the stored range, and then add back between
+        // 0 and 2 subranges at the ends of the range to insert.
+        self.btm.remove(&stored_start_wrapper);
+        if stored_start_wrapper.start < new_range.start {
+            // Insert the piece left of the range to insert.
+            self.btm.insert(
+                RangeStartWrapper::new(
+                    stored_start_wrapper.end_wrapper.range.start..new_range.start.clone(),
+                ),
+                stored_value.clone(),
+            );
+        }
+        if stored_start_wrapper.end_wrapper.range.end > new_range.end {
+            // Insert the piece right of the range to insert.
+            self.btm.insert(
+                RangeStartWrapper::new(
+                    new_range.end.clone()..stored_start_wrapper.end_wrapper.range.end,
+                ),
+                stored_value,
+            );
         }
     }
 
@@ -610,7 +562,7 @@ impl<K: Debug, V: Debug> Debug for RangeMap<K, V> {
 impl<K, V> FromIterator<(Range<K>, V)> for RangeMap<K, V>
 where
     K: Ord + Clone,
-    V: PartialEq + Clone,
+    V: Clone,
 {
     fn from_iter<T: IntoIterator<Item = (Range<K>, V)>>(iter: T) -> Self {
         let mut range_map = RangeMap::new();
@@ -622,7 +574,7 @@ where
 impl<K, V> Extend<(Range<K>, V)> for RangeMap<K, V>
 where
     K: Ord + Clone,
-    V: PartialEq + Clone,
+    V: Clone,
 {
     fn extend<T: IntoIterator<Item = (Range<K>, V)>>(&mut self, iter: T) {
         iter.into_iter().for_each(move |(k, v)| {
@@ -654,7 +606,7 @@ where
 impl<'de, K, V> Deserialize<'de> for RangeMap<K, V>
 where
     K: Ord + Clone + Deserialize<'de>,
-    V: PartialEq + Clone + Deserialize<'de>,
+    V: Clone + Deserialize<'de>,
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -682,7 +634,7 @@ impl<K, V> RangeMapVisitor<K, V> {
 impl<'de, K, V> Visitor<'de> for RangeMapVisitor<K, V>
 where
     K: Ord + Clone + Deserialize<'de>,
-    V: PartialEq + Clone + Deserialize<'de>,
+    V: Clone + Deserialize<'de>,
 {
     type Value = RangeMap<K, V>;
 
@@ -819,7 +771,7 @@ where
     }
 }
 
-impl<K: Ord + Clone, V: PartialEq + Clone, const N: usize> From<[(Range<K>, V); N]> for RangeMap<K, V> {
+impl<K: Ord + Clone, V: Clone, const N: usize> From<[(Range<K>, V); N]> for RangeMap<K, V> {
     fn from(value: [(Range<K>, V); N]) -> Self {
         let mut map = Self::new();
         for (range, value) in IntoIterator::into_iter(value) {
@@ -859,7 +811,7 @@ mod tests {
     impl<K, V> Arbitrary for RangeMap<K, V>
     where
         K: Ord + Clone + Debug + Arbitrary + 'static,
-        V: Clone + PartialEq + Arbitrary + 'static,
+        V: Clone + Arbitrary + 'static,
     {
         type Parameters = ();
         type Strategy = BoxedStrategy<Self>;
@@ -1051,9 +1003,11 @@ mod tests {
         // 0 1 2 3 4 5 6 7 8 9
         // ◌ ◌ ◌ ●---◌ ◌ ◌ ◌ ◌
         range_map.insert(3..5, false);
+        // Adjacent ranges with same value are NOT merged.
         // 0 1 2 3 4 5 6 7 8 9
-        // ◌ ●-------◌ ◌ ◌ ◌ ◌
-        assert_eq!(range_map.to_vec(), vec![(1..5, false)]);
+        // ◌ ●---◌ ◌ ◌ ◌ ◌ ◌ ◌
+        // ◌ ◌ ◌ ●---◌ ◌ ◌ ◌ ◌
+        assert_eq!(range_map.to_vec(), vec![(1..3, false), (3..5, false)]);
     }
 
     #[test]
@@ -1080,9 +1034,11 @@ mod tests {
         // 0 1 2 3 4 5 6 7 8 9
         // ◌ ◌ ◌ ●---◌ ◌ ◌ ◌ ◌
         range_map.insert(3..5, false);
+        // Stored range is trimmed at overlap; same value does NOT extend it.
         // 0 1 2 3 4 5 6 7 8 9
-        // ◌ ●-------◌ ◌ ◌ ◌ ◌
-        assert_eq!(range_map.to_vec(), vec![(1..5, false)]);
+        // ◌ ●---◌ ◌ ◌ ◌ ◌ ◌ ◌
+        // ◌ ◌ ◌ ●---◌ ◌ ◌ ◌ ◌
+        assert_eq!(range_map.to_vec(), vec![(1..3, false), (3..5, false)]);
     }
 
     #[test]
@@ -1109,9 +1065,11 @@ mod tests {
         // 0 1 2 3 4 5 6 7 8 9
         // ◌ ●---◌ ◌ ◌ ◌ ◌ ◌ ◌
         range_map.insert(1..3, false);
+        // Adjacent ranges with same value are NOT merged.
         // 0 1 2 3 4 5 6 7 8 9
-        // ◌ ●-------◌ ◌ ◌ ◌ ◌
-        assert_eq!(range_map.to_vec(), vec![(1..5, false)]);
+        // ◌ ●---◌ ◌ ◌ ◌ ◌ ◌ ◌
+        // ◌ ◌ ◌ ●---◌ ◌ ◌ ◌ ◌
+        assert_eq!(range_map.to_vec(), vec![(1..3, false), (3..5, false)]);
     }
 
     #[test]
@@ -1138,9 +1096,15 @@ mod tests {
         // 0 1 2 3 4 5 6 7 8 9
         // ◌ ◌ ●---◌ ◌ ◌ ◌ ◌ ◌ ◌
         range_map.insert(2..4, false);
+        // Stored range is split; same value does NOT prevent the split.
         // 0 1 2 3 4 5 6 7 8 9
-        // ◌ ●-------◌ ◌ ◌ ◌ ◌
-        assert_eq!(range_map.to_vec(), vec![(1..5, false)]);
+        // ◌ ●-◌ ◌ ◌ ◌ ◌ ◌ ◌ ◌
+        // ◌ ◌ ●---◌ ◌ ◌ ◌ ◌ ◌
+        // ◌ ◌ ◌ ◌ ●-◌ ◌ ◌ ◌ ◌
+        assert_eq!(
+            range_map.to_vec(),
+            vec![(1..2, false), (2..4, false), (4..5, false)]
+        );
     }
 
     #[test]
@@ -1163,7 +1127,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_at_end_of_existing_range_should_coalesce() {
+    fn replace_adjacent_range_with_same_value_does_not_coalesce() {
         let mut range_map: RangeMap<u32, bool> = RangeMap::new();
         // 0 1 2 3 4 5 6 7 8 9
         // ◌ ●---◌ ◌ ◌ ◌ ◌ ◌ ◌
@@ -1174,50 +1138,11 @@ mod tests {
         // 0 1 2 3 4 5 6 7 8 9
         // ◌ ◌ ◌ ●---◌ ◌ ◌ ◌ ◌
         range_map.insert(3..5, false);
+        // Adjacent ranges with same value are NOT merged.
         // 0 1 2 3 4 5 6 7 8 9
-        // ◌ ●-------◌ ◌ ◌ ◌ ◌
-        assert_eq!(range_map.to_vec(), vec![(1..5, false)]);
-    }
-
-    #[test]
-    // Test every permutation of a bunch of touching and overlapping ranges.
-    fn lots_of_interesting_ranges() {
-        use crate::dense::DenseU32RangeMap;
-        use permutator::Permutation;
-
-        let mut ranges_with_values = [
-            (2..3, false),
-            // A duplicate duplicates
-            (2..3, false),
-            // Almost a duplicate, but with a different value
-            (2..3, true),
-            // A few small ranges, some of them overlapping others,
-            // some of them touching others
-            (3..5, true),
-            (4..6, true),
-            (5..7, true),
-            // A really big range
-            (2..6, true),
-        ];
-
-        ranges_with_values.permutation().for_each(|permutation| {
-            let mut range_map: RangeMap<u32, bool> = RangeMap::new();
-            let mut dense: DenseU32RangeMap<bool> = DenseU32RangeMap::new();
-
-            for (k, v) in permutation {
-                // Insert it into both maps.
-                range_map.insert(k.clone(), v);
-                // NOTE: Clippy's `range_minus_one` lint is a bit overzealous here,
-                // because we _can't_ pass an open-ended range to `insert`.
-                #[allow(clippy::range_minus_one)]
-                dense.insert(k.start..=(k.end - 1), v);
-
-                // At every step, both maps should contain the same stuff.
-                let sparse = range_map.to_vec();
-                let dense = dense.to_end_exclusive_vec();
-                assert_eq!(sparse, dense);
-            }
-        });
+        // ◌ ●---◌ ◌ ◌ ◌ ◌ ◌ ◌
+        // ◌ ◌ ◌ ●---◌ ◌ ◌ ◌ ◌
+        assert_eq!(range_map.to_vec(), vec![(1..3, false), (3..5, false)]);
     }
 
     //
