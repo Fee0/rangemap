@@ -1,15 +1,63 @@
 # rangemap
 
+> **This is a fork of [`jeffparsons/rangemap`](https://github.com/jeffparsons/rangemap) with auto-coalescing removed.**
+> See [Differences from upstream](#differences-from-upstream) below.
+
 [![Crate](https://img.shields.io/crates/v/rangemap.svg)](https://crates.io/crates/rangemap)
 [![Docs](https://docs.rs/rangemap/badge.svg)](https://docs.rs/rangemap)
 [![Build status](https://github.com/jeffparsons/rangemap/workflows/CI/badge.svg)](https://github.com/jeffparsons/rangemap/actions)
 [![Rust](https://img.shields.io/badge/rust-1.81.0%2B-blue.svg?maxAge=3600)](https://github.com/jeffparsons/rangemap) <!-- Don't forget to update the GitHub actions config when bumping minimum Rust version. -->
 
 [`RangeMap`] and [`RangeInclusiveMap`] are map data structures whose keys
-are stored as ranges. Contiguous and overlapping ranges that map to the same
-value are coalesced into a single range.
+are stored as ranges. Each key point maps to at most one value; inserting a
+range that overlaps an existing one trims or splits the existing range to
+make room.
 
 Corresponding [`RangeSet`] and [`RangeInclusiveSet`] structures are also provided.
+
+
+## Differences from upstream
+
+The upstream `rangemap` crate automatically **coalesces** adjacent or
+overlapping ranges that map to the same value into a single range. This fork
+removes that behaviour.
+
+### What stays the same
+
+- A key point is covered by **at most one range** at all times.
+- Inserting a range that **overlaps** an existing range with a **different
+  value** trims or splits the existing range exactly as before.
+- `get(k)` always returns the value from the **last insert** that covered `k`
+  (last-writer-wins).
+
+### What changes
+
+Adjacent or overlapping ranges with the **same value** are no longer merged.
+Each inserted range is stored independently:
+
+```
+// Upstream (coalescing on):
+insert(1..5, false)  →  [(1..5, false)]
+insert(3..7, false)  →  [(1..7, false)]   // merged — same value
+
+// This fork (coalescing off):
+insert(1..5, false)  →  [(1..5, false)]
+insert(3..7, false)  →  [(1..3, false), (3..7, false)]  // 1..5 trimmed, 3..7 kept as-is
+```
+
+### When this is useful
+
+- You want to track **which specific insert covered which range** — e.g.
+  audit logs, reservations, or version history — rather than just the
+  resulting value at each point.
+- Your value type does not implement `PartialEq` (no longer required).
+- You need a **stable entry count**: inserting N non-overlapping ranges always
+  produces N entries; coalescing could silently collapse them.
+
+### Trade-off
+
+Because adjacent same-value ranges are not compacted, the map can accumulate
+more entries over time if many adjacent same-value ranges are inserted.
 
 
 ## Different kinds of ranges
@@ -43,8 +91,9 @@ If the choice is not obvious in your case, consider these differences:
   be a more natural way to express these ranges anyway.
 - If you are using `RangeInclusive`, then it must be possible to define
   _successor_ and _predecessor_ functions for your key type `K`,
-  because adjacent ranges can not be detected (and thereby coalesced)
-  simply by testing their ends for equality. For key types that represent
+  because when an overlapping insert splits an existing inclusive range,
+  the split boundary must be computed as `new_start - 1` or `new_end + 1`,
+  which requires these functions. For key types that represent
   points on a continuum, defining these functions may be awkward and error-prone.
   For key types that represent discrete objects, this is usually much
   more straightforward.
