@@ -55,7 +55,7 @@ let people = ["Alice", "Bob", "Carol"];
 let mut roster = RangeMap::new();
 
 // Set up initial roster.
-let start_of_roster = Utc.with_ymd_and_hms(2019, 1, 7);
+let start_of_roster = Utc.with_ymd_and_hms(2019, 1, 7, 0, 0, 0).unwrap();
 let mut week_start = start_of_roster;
 for _ in 0..3 {
     for person in &people {

@@ -291,7 +291,7 @@ where
         if let Some((stored_start_wrapper, stored_value)) = candidates.next() {
             let (stored_start_wrapper, stored_value) =
                 (stored_start_wrapper.clone(), stored_value.clone());
-            self.adjust_touching_ranges_for_insert(
+            self.adjust_overlapping_range_for_insert(
                 stored_start_wrapper,
                 stored_value,
                 &new_start_wrapper.end_wrapper.range,
@@ -325,7 +325,7 @@ where
             let stored_start_wrapper = stored_start_wrapper.clone();
             let stored_value = stored_value.clone();
 
-            self.adjust_touching_ranges_for_insert(
+            self.adjust_overlapping_range_for_insert(
                 stored_start_wrapper,
                 stored_value,
                 &new_start_wrapper.end_wrapper.range,
@@ -410,7 +410,7 @@ where
         }
     }
 
-    fn adjust_touching_ranges_for_insert(
+    fn adjust_overlapping_range_for_insert(
         &mut self,
         stored_start_wrapper: RangeStartWrapper<K>,
         stored_value: V,
@@ -970,7 +970,7 @@ mod tests {
     impl<K, V> RangeMapExt<K, V> for RangeMap<K, V>
     where
         K: Ord + Clone,
-        V: PartialEq + Clone,
+        V: Clone,
     {
         fn to_vec(&self) -> Vec<(Range<K>, V)> {
             self.iter().map(|(kr, v)| (kr.clone(), v.clone())).collect()
@@ -1143,6 +1143,63 @@ mod tests {
         // ◌ ●---◌ ◌ ◌ ◌ ◌ ◌ ◌
         // ◌ ◌ ◌ ●---◌ ◌ ◌ ◌ ◌
         assert_eq!(range_map.to_vec(), vec![(1..3, false), (3..5, false)]);
+    }
+
+    #[test]
+    fn overlapping_same_value_ranges_are_not_merged() {
+        let mut range_map: RangeMap<u32, bool> = RangeMap::new();
+        // 0 1 2 3 4 5 6 7 8 9
+        // ◌ ●-------◌ ◌ ◌ ◌ ◌
+        range_map.insert(1..5, false);
+        // 0 1 2 3 4 5 6 7 8 9
+        // ◌ ◌ ◌ ●-------◌ ◌ ◌
+        range_map.insert(3..7, false);
+        // Overlapping insert trims the stored range; same value does NOT extend it.
+        // 0 1 2 3 4 5 6 7 8 9
+        // ◌ ●-◌ ◌ ◌ ◌ ◌ ◌ ◌ ◌
+        // ◌ ◌ ◌ ●-------◌ ◌ ◌
+        assert_eq!(range_map.to_vec(), vec![(1..3, false), (3..7, false)]);
+    }
+
+    #[test]
+    // Test every permutation of overlapping and touching ranges and verify
+    // that get() returns the correct (last-writer-wins) value for every key,
+    // regardless of insertion order.
+    fn insert_permutations_have_consistent_get_results() {
+        use permutator::Permutation;
+
+        let mut ranges_with_values: Vec<(core::ops::Range<u32>, bool)> = vec![
+            (2..3, false),
+            (2..3, false),
+            (2..3, true),
+            (3..5, true),
+            (4..6, true),
+            (5..7, true),
+            (2..6, true),
+        ];
+
+        ranges_with_values.permutation().for_each(|permutation| {
+            // Build a reference map by applying inserts sequentially,
+            // tracking last-write-wins at each individual key.
+            let mut expected: alloc::collections::BTreeMap<u32, bool> =
+                alloc::collections::BTreeMap::new();
+            let mut range_map: RangeMap<u32, bool> = RangeMap::new();
+
+            for (range, value) in permutation {
+                for k in range.start..range.end {
+                    expected.insert(k, value);
+                }
+                range_map.insert(range, value);
+            }
+
+            for (k, expected_value) in &expected {
+                assert_eq!(
+                    range_map.get(k),
+                    Some(expected_value),
+                    "wrong value at key {k}"
+                );
+            }
+        });
     }
 
     //

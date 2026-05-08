@@ -11,7 +11,7 @@ homepage = "https://github.com/jeffparsons/rangemap"
 description = """
 Map and set data structures whose keys are stored as ranges.
 
-Contiguous and overlapping ranges that map to the same value are coalesced into a single range.
+Overlapping ranges are trimmed or split on insert; adjacent same-value ranges are kept separate.
 """
 categories = ["data-structures"]
 rust-version = "1.81.0"
